@@ -13,6 +13,7 @@ Telegram-бот для Дарины — воронка продаж через �
 import asyncio
 import logging
 import html
+import hashlib
 from contextlib import closing
 import sqlite3
 from datetime import datetime
@@ -52,6 +53,20 @@ RESULT_VIDEOS = {
 
 # Словарь подкастов (mp3) по типу результата
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def build_code_fingerprint():
+    """Отпечаток файлов, определяющих версию бота, независимо от Git на хостинге."""
+    digest = hashlib.sha256()
+    for name in ('bot.py', 'config.py', 'requirements.txt'):
+        with open(os.path.join(BASE_DIR, name), 'rb') as source:
+            content = source.read().replace(b'\r\n', b'\n')
+        digest.update(name.encode('utf-8') + b'\0' + content + b'\0')
+    return digest.hexdigest()[:12]
+
+
+CODE_FINGERPRINT = build_code_fingerprint()
+
 RESULT_PODCASTS = {
     "A": os.path.join(BASE_DIR, "podcasts", "1.mp3"),
     "B": os.path.join(BASE_DIR, "podcasts", "2.mp3"),
@@ -364,6 +379,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "и узнай свой тип проявленности в видеоконтенте! 🎬"
     )
     await update.message.reply_text(text, parse_mode='HTML')
+
+
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает отпечаток файлов версии, запущенной в процессе бота."""
+    await update.message.reply_text(f'Версия кода: {CODE_FINGERPRINT}')
 
 
 async def cmd_setvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -841,6 +861,7 @@ def main():
     # Команды
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("version", cmd_version))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("setvideo", cmd_setvideo))
 
