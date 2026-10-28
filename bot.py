@@ -12,6 +12,8 @@ Telegram-бот для Дарины — воронка продаж через �
 
 import asyncio
 import logging
+import html
+from contextlib import closing
 import sqlite3
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,7 +25,7 @@ from telegram.error import TelegramError
 from telegram.request import HTTPXRequest
 
 from config import (
-    BOT_TOKEN, CHANNEL_USERNAME, ADMIN_ID, ADMIN_CONTACT,
+    BOT_TOKEN, TELEGRAM_PROXY, CHANNEL_USERNAME, ADMIN_ID, ADMIN_CONTACT,
     DB_PATH, QUESTIONS, RESULTS, MESSAGES,
     OBJECTION_QUESTIONS,
     WELCOME_VIDEO, WELCOME_VIDEO_AS_NOTE,
@@ -91,6 +93,7 @@ class Database:
                 finished_at TIMESTAMP
             )
         ''')
+        cursor.execute('CREATE TABLE IF NOT EXISTS videos (video_type TEXT PRIMARY KEY, file_id TEXT NOT NULL)')
         conn.commit()
         conn.close()
         logger.info("✅ База данных инициализирована")
@@ -114,6 +117,21 @@ class Database:
         ''', (result_type, answers, datetime.now(), user_id))
         conn.commit()
         conn.close()
+
+    def get_result(self, user_id: int):
+        with closing(self._connect()) as conn:
+            row = conn.execute('SELECT result_type FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        return row[0] if row else None
+
+    def save_video(self, video_type: str, file_id: str):
+        with closing(self._connect()) as conn:
+            conn.execute('INSERT OR REPLACE INTO videos (video_type, file_id) VALUES (?, ?)', (video_type, file_id))
+            conn.commit()
+
+    def get_video(self, video_type: str):
+        with closing(self._connect()) as conn:
+            row = conn.execute('SELECT file_id FROM videos WHERE video_type = ?', (video_type,)).fetchone()
+        return row[0] if row else None
 
     def save_intensive_response(self, user_id: int, response: str):
         conn = self._connect()
@@ -160,7 +178,7 @@ db = Database()
 
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
-async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool | None:
     """Проверяет подписку пользователя на канал."""
     try:
         member = await context.bot.get_chat_member(
@@ -170,7 +188,7 @@ async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
         return member.status in ['member', 'administrator', 'creator']
     except TelegramError as e:
         logger.error(f"Ошибка проверки подписки для {user_id}: {e}")
-        return False
+        return None
 
 
 def calculate_result(answers: dict) -> str:
@@ -303,18 +321,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_video_or_text(
         update,
         context,
-        video_file_id=WELCOME_VIDEO,
+        video_file_id=get_video(context, 'welcome', WELCOME_VIDEO),
         caption=MESSAGES['welcome'],
         text_fallback=MESSAGES['welcome'],
         reply_markup=keyboard,
-        video_as_note=WELCOME_VIDEO_AS_NOTE,
+        video_as_note=WELCOME_VIDEO_AS_NOTE if not db.get_video('welcome') else False,
     )
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика для администратора."""
     user = update.effective_user
-    if ADMIN_ID and user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         return
 
     stats = db.get_stats()
@@ -360,7 +378,7 @@ async def cmd_setvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /setvideo consultation
     """
     user = update.effective_user
-    if ADMIN_ID and user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         return
 
     if not update.message.reply_to_message or not update.message.reply_to_message.video:
@@ -393,19 +411,19 @@ async def cmd_setvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Сохраняем file_id в bot_data для использования
     context.bot_data[f'video_{video_type}'] = file_id
+    db.save_video(video_type, file_id)
 
     await update.message.reply_text(
         f"✅ Видео <b>{video_type}</b> установлено!\n"
         f"file_id: <code>{file_id}</code>\n\n"
-        "💡 Чтобы видео сохранилось после перезапуска, "
-        "добавьте file_id в config.py или .env файл.",
+        "Видео сохранено и будет доступно после перезапуска.",
         parse_mode='HTML'
     )
 
 
 def get_video(context: ContextTypes.DEFAULT_TYPE, video_type: str, default: str = '') -> str:
     """Получает file_id видео: сначала из bot_data (динамически), потом из config."""
-    return context.bot_data.get(f'video_{video_type}', default)
+    return context.bot_data.get(f'video_{video_type}') or db.get_video(video_type) or default
 
 
 # ============ ОБРАБОТЧИКИ CALLBACK ============
@@ -449,11 +467,12 @@ async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q_index = 0
     keyboard = build_question_keyboard(q_index)
 
-    await update.callback_query.edit_message_text(
-        text=format_question_text(q_index),
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
+    query = update.callback_query
+    if query.message.text is None:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(format_question_text(q_index), reply_markup=keyboard, parse_mode='HTML')
+    else:
+        await query.edit_message_text(text=format_question_text(q_index), reply_markup=keyboard, parse_mode='HTML')
 
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -464,6 +483,9 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split("_")
     q_index = int(parts[1])
     answer = parts[2]
+
+    if not 0 <= q_index < len(QUESTIONS) or q_index != context.user_data.get('current_question') or answer not in QUESTIONS[q_index]['options']:
+        return
 
     # Сохраняем ответ
     if 'answers' not in context.user_data:
@@ -514,26 +536,37 @@ async def handle_check_subscription(update: Update, context: ContextTypes.DEFAUL
 
     is_subscribed = await check_subscription(user_id, context)
 
+    if is_subscribed is None:
+        await query.message.reply_text('Не удалось проверить подписку. Попробуй ещё раз чуть позже.')
+        return
+
     if not is_subscribed:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME}")],
             [InlineKeyboardButton("✅ Я подписался(ась)", callback_data="check_subscription")]
         ])
 
-        await query.edit_message_text(
-            text=MESSAGES['not_subscribed'],
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
+        if query.message.text != MESSAGES['not_subscribed']:
+            await query.edit_message_text(
+                text=MESSAGES['not_subscribed'],
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        else:
+            await query.message.reply_text('Подписка пока не обнаружена. Попробуй ещё раз после подписки.')
         return
 
     # Подписан — выдаём результат
-    result_type = context.user_data.get('result_type', 'A')
+    result_type = context.user_data.get('result_type') or db.get_result(user_id)
+    if result_type not in RESULTS:
+        await query.message.reply_text('Не удалось найти результат теста. Отправь /start и пройди тест заново.')
+        return
+    context.user_data['result_type'] = result_type
     result = RESULTS[result_type]
 
-    # Редактируем старое сообщение и предлагаем получить подкаст
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎧 Получить подкаст", url="https://t.me/Dana_lavanda")]
+    podcast_path = RESULT_PODCASTS[result_type]
+    keyboard = None if os.path.isfile(podcast_path) else InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎧 Получить подкаст у Дарины", url="https://t.me/Dana_lavanda")]
     ])
 
     await query.edit_message_text(
@@ -548,6 +581,22 @@ async def handle_check_subscription(update: Update, context: ContextTypes.DEFAUL
         text=f"<b>{result['title']}</b>\n\n{result['text']}",
         parse_mode='HTML'
     )
+
+    video = get_video(context, f'result_{result_type.lower()}', RESULT_VIDEOS[result_type])
+    if video:
+        await send_video_or_text(query.message.chat_id, context, video)
+    if os.path.isfile(podcast_path):
+        try:
+            with open(podcast_path, 'rb') as podcast:
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=podcast, title=PODCAST_TITLES[result_type])
+        except (OSError, TelegramError) as e:
+            logger.error('Ошибка отправки подкаста: %s', e)
+            await query.message.reply_text('Не удалось отправить подкаст. Напиши Дарине: @Dana_lavanda')
+
+    if result_type == 'D':
+        await send_consultation_offer(query.message.chat_id, context)
+    else:
+        await send_intensive_offer(query.message.chat_id, context, result_type)
 
 
 async def send_intensive_offer(chat_id: int, context: ContextTypes.DEFAULT_TYPE, result_type: str):
@@ -596,7 +645,10 @@ async def handle_intensive_yes(update: Update, context: ContextTypes.DEFAULT_TYP
     """Пользователь хочет на интенсив."""
     query = update.callback_query
     user_id = update.effective_user.id
-    result_type = context.user_data.get('result_type', 'A')
+    result_type = context.user_data.get('result_type') or db.get_result(user_id)
+    if result_type not in RESULTS:
+        await query.message.reply_text('Не удалось найти результат теста. Отправь /start и пройди тест заново.')
+        return
     result_title = RESULTS[result_type]['title']
 
     db.save_intensive_response(user_id, 'yes')
@@ -618,7 +670,7 @@ async def handle_intensive_yes(update: Update, context: ContextTypes.DEFAULT_TYP
         user = update.effective_user
         admin_msg = (
             f"🔔 <b>Новая заявка на интенсив!</b>\n\n"
-            f"👤 {user.first_name or ''} {user.last_name or ''}\n"
+            f"👤 {html.escape(user.first_name or '')} {html.escape(user.last_name or '')}\n"
             f"📱 @{user.username or 'нет username'}\n"
             f"🆔 {user.id}\n"
             f"📋 Результат: {result_title}"
@@ -705,7 +757,7 @@ async def handle_final_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Когда пользователь отправляет видео — показывает file_id (для админа)."""
     user = update.effective_user
-    if ADMIN_ID and user.id != ADMIN_ID:
+    if not ADMIN_ID or user.id != ADMIN_ID:
         return
 
     video = update.message.video or update.message.video_note
@@ -743,9 +795,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = update.effective_user
             admin_text = (
                 f"💬 <b>Сообщение от пользователя:</b>\n\n"
-                f"👤 {user.first_name or ''} @{user.username or 'нет'}\n"
+                f"👤 {html.escape(user.first_name or '')} @{html.escape(user.username or 'нет')}\n"
                 f"🆔 {user.id}\n\n"
-                f"📝 {update.message.text}"
+                f"📝 {html.escape(update.message.text)}"
             )
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -766,6 +818,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Запуск бота."""
     request = HTTPXRequest(
+        proxy=TELEGRAM_PROXY or None,
         connect_timeout=15.0,
         read_timeout=25.0,
         write_timeout=25.0,
@@ -773,6 +826,7 @@ def main():
         http_version='1.1'
     )
     get_updates_request = HTTPXRequest(
+        proxy=TELEGRAM_PROXY or None,
         connect_timeout=15.0,
         read_timeout=90.0,
         write_timeout=25.0,

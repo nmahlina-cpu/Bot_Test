@@ -5,6 +5,7 @@ load_dotenv()
 
 # ====== НАСТРОЙКИ БОТА ======
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+TELEGRAM_PROXY = os.getenv('TELEGRAM_PROXY', '').strip()
 
 # Канал для проверки подписки (без @)
 CHANNEL_USERNAME = 'darina_v_smisle'

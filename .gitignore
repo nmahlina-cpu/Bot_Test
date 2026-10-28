@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.db
 *.rar
+.venv/
+bot-*.log
+*.pem
