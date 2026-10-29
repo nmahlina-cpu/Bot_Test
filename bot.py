@@ -462,6 +462,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "check_subscription":
         await handle_check_subscription(update, context)
 
+    elif data.startswith("get_podcast_"):
+        await handle_get_podcast(update, context)
+
     elif data == "intensive_yes":
         await handle_intensive_yes(update, context)
 
@@ -584,14 +587,8 @@ async def handle_check_subscription(update: Update, context: ContextTypes.DEFAUL
     context.user_data['result_type'] = result_type
     result = RESULTS[result_type]
 
-    podcast_path = RESULT_PODCASTS[result_type]
-    keyboard = None if os.path.isfile(podcast_path) else InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎧 Получить подкаст у Дарины", url="https://t.me/Dana_lavanda")]
-    ])
-
     await query.edit_message_text(
         text=f"✅ Подписка подтверждена! Вот твой результат 👇",
-        reply_markup=keyboard,
         parse_mode='HTML'
     )
 
@@ -602,16 +599,44 @@ async def handle_check_subscription(update: Update, context: ContextTypes.DEFAUL
         parse_mode='HTML'
     )
 
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton('Получить подкаст', callback_data=f'get_podcast_{result_type}')]
+    ])
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text='У меня для тебя ещё есть кое-что особенное. Хочешь получить подкаст?',
+        reply_markup=keyboard,
+    )
+
+
+async def handle_get_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет подкаст выбранного типа и затем следующее предложение."""
+    query = update.callback_query
+    result_type = query.data.removeprefix('get_podcast_')
+    if result_type not in RESULTS or db.get_result(update.effective_user.id) != result_type:
+        await query.message.reply_text('Не удалось найти результат теста. Отправь /start и пройди тест заново.')
+        return
+    context.user_data['result_type'] = result_type
+    podcast_path = RESULT_PODCASTS[result_type]
     video = get_video(context, f'result_{result_type.lower()}', RESULT_VIDEOS[result_type])
-    if video:
-        await send_video_or_text(query.message.chat_id, context, video)
-    if os.path.isfile(podcast_path):
-        try:
+    try:
+        if os.path.isfile(podcast_path):
             with open(podcast_path, 'rb') as podcast:
                 await context.bot.send_audio(chat_id=query.message.chat_id, audio=podcast, title=PODCAST_TITLES[result_type])
-        except (OSError, TelegramError) as e:
-            logger.error('Ошибка отправки подкаста: %s', e)
-            await query.message.reply_text('Не удалось отправить подкаст. Напиши Дарине: @Dana_lavanda')
+        elif video:
+            await context.bot.send_video(chat_id=query.message.chat_id, video=resolve_video_source(video))
+        else:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text='Чтобы получить подкаст, напиши Дарине.',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Написать Дарине', url='https://t.me/Dana_lavanda')]])
+            )
+    except (OSError, TelegramError) as e:
+        logger.error('Ошибка отправки подкаста: %s', e)
+        await query.message.reply_text('Не удалось отправить подкаст. Попробуй нажать кнопку ещё раз.')
+        return
+
+    await query.edit_message_reply_markup(reply_markup=None)
 
     if result_type == 'D':
         await send_consultation_offer(query.message.chat_id, context)
@@ -622,8 +647,8 @@ async def handle_check_subscription(update: Update, context: ContextTypes.DEFAUL
 async def send_intensive_offer(chat_id: int, context: ContextTypes.DEFAULT_TYPE, result_type: str):
     """Отправляет предложение об интенсиве (типы A, B, C)."""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 Да, хочу на интенсив!", callback_data="intensive_yes")],
-        [InlineKeyboardButton("🚫 Нет, пока не хочу", callback_data="intensive_no")]
+        [InlineKeyboardButton("Да, хочу", callback_data="intensive_yes")],
+        [InlineKeyboardButton("Нет, пока не хочу", callback_data="intensive_no")]
     ])
 
     await context.bot.send_message(
