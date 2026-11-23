@@ -16,6 +16,8 @@ import html
 import hashlib
 from contextlib import closing
 import sqlite3
+import time
+from urllib.parse import quote
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -27,7 +29,7 @@ from telegram.request import HTTPXRequest
 
 from config import (
     BOT_TOKEN, TELEGRAM_PROXY, CHANNEL_USERNAME, ADMIN_ID, ADMIN_CONTACT,
-    DB_PATH, QUESTIONS, RESULTS, MESSAGES,
+    DB_PATH, QUESTIONS, RESULTS, MESSAGES, PODCAST_INTROS,
     OBJECTION_QUESTIONS,
     WELCOME_VIDEO, WELCOME_VIDEO_AS_NOTE,
     VIDEO_RESULT_A, VIDEO_RESULT_B,
@@ -109,6 +111,7 @@ class Database:
             )
         ''')
         cursor.execute('CREATE TABLE IF NOT EXISTS videos (video_type TEXT PRIMARY KEY, file_id TEXT NOT NULL)')
+        cursor.execute('CREATE TABLE IF NOT EXISTS pending_offers (user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, result_type TEXT NOT NULL, due_at REAL NOT NULL)')
         conn.commit()
         conn.close()
         logger.info("✅ База данных инициализирована")
@@ -137,6 +140,20 @@ class Database:
         with closing(self._connect()) as conn:
             row = conn.execute('SELECT result_type FROM users WHERE user_id = ?', (user_id,)).fetchone()
         return row[0] if row else None
+
+    def schedule_offer(self, user_id, chat_id, result_type):
+        with closing(self._connect()) as conn:
+            conn.execute('INSERT OR IGNORE INTO pending_offers VALUES (?, ?, ?, ?)', (user_id, chat_id, result_type, time.time() + 600))
+            conn.commit()
+
+    def due_offers(self):
+        with closing(self._connect()) as conn:
+            return conn.execute('SELECT user_id, chat_id, result_type, due_at FROM pending_offers WHERE due_at <= ?', (time.time(),)).fetchall()
+
+    def remove_offer(self, user_id, due_at):
+        with closing(self._connect()) as conn:
+            conn.execute('DELETE FROM pending_offers WHERE user_id = ? AND due_at = ?', (user_id, due_at))
+            conn.commit()
 
     def save_video(self, video_type: str, file_id: str):
         with closing(self._connect()) as conn:
@@ -599,12 +616,16 @@ async def handle_check_subscription(update: Update, context: ContextTypes.DEFAUL
         parse_mode='HTML'
     )
 
+    if result_type == 'D':
+        await send_consultation_offer(query.message.chat_id, context)
+        return
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton('Получить подкаст', callback_data=f'get_podcast_{result_type}')]
     ])
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text='У меня для тебя ещё есть кое-что особенное. Хочешь получить подкаст?',
+        text=PODCAST_INTROS[result_type],
         reply_markup=keyboard,
     )
 
@@ -617,38 +638,49 @@ async def handle_get_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text('Не удалось найти результат теста. Отправь /start и пройди тест заново.')
         return
     context.user_data['result_type'] = result_type
-    podcast_path = RESULT_PODCASTS[result_type]
-    video = get_video(context, f'result_{result_type.lower()}', RESULT_VIDEOS[result_type])
-    try:
-        if os.path.isfile(podcast_path):
-            with open(podcast_path, 'rb') as podcast:
-                await context.bot.send_audio(chat_id=query.message.chat_id, audio=podcast, title=PODCAST_TITLES[result_type])
-        elif video:
-            await context.bot.send_video(chat_id=query.message.chat_id, video=resolve_video_source(video))
-        else:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text='Чтобы получить подкаст, напиши Дарине.',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Написать Дарине', url='https://t.me/Dana_lavanda')]])
-            )
-    except (OSError, TelegramError) as e:
-        logger.error('Ошибка отправки подкаста: %s', e)
-        await query.message.reply_text('Не удалось отправить подкаст. Попробуй нажать кнопку ещё раз.')
-        return
-
+    text = quote(f'Здравствуйте! Я прошла тест, мой результат — тип {result_type}. Хочу получить подкаст.')
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text='Чтобы получить подкаст, напиши Дарине.',
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Написать Дарине', url=f'https://t.me/Dana_lavanda?text={text}')]])
+    )
+    db.schedule_offer(update.effective_user.id, query.message.chat_id, result_type)
     await query.edit_message_reply_markup(reply_markup=None)
 
-    if result_type == 'D':
-        await send_consultation_offer(query.message.chat_id, context)
-    else:
-        await send_intensive_offer(query.message.chat_id, context, result_type)
+
+async def offer_worker(application):
+    while True:
+        try:
+            for user_id, chat_id, result_type, due_at in db.due_offers():
+                try:
+                    context = application.context_types.context(application=application)
+                    if result_type == 'D':
+                        await send_consultation_offer(chat_id, context)
+                    else:
+                        await send_intensive_offer(chat_id, context, result_type)
+                    db.remove_offer(user_id, due_at)
+                except Exception:
+                    logger.exception('Не удалось отправить отложенное предложение пользователю %s', user_id)
+        except Exception:
+            logger.exception('Ошибка обработки отложенных предложений')
+        await asyncio.sleep(10)
+
+
+async def start_offer_worker(application):
+    application.bot_data['offer_worker'] = asyncio.create_task(offer_worker(application))
+
+
+async def stop_offer_worker(application):
+    task = application.bot_data.get('offer_worker')
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def send_intensive_offer(chat_id: int, context: ContextTypes.DEFAULT_TYPE, result_type: str):
     """Отправляет предложение об интенсиве (типы A, B, C)."""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Да, хочу", callback_data="intensive_yes")],
-        [InlineKeyboardButton("Нет, пока не хочу", callback_data="intensive_no")]
+        [InlineKeyboardButton("Хочу на интенсив", url=f"https://t.me/Dana_lavanda?text={quote('Хочу на интенсив')}")]
     ])
 
     await context.bot.send_message(
@@ -879,6 +911,7 @@ def main():
         http_version='1.1'
     )
     application = Application.builder()
+    application = application.post_init(start_offer_worker).post_shutdown(stop_offer_worker)
     application = application.request(request)
     application = application.get_updates_request(get_updates_request)
     application = application.token(BOT_TOKEN).build()
